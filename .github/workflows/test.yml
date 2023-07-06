@@ -41,6 +41,8 @@ jobs:
         uses: ./.github/workflows/install-circt
         with:
           version: ${{ matrix.circt }}
+      - name: Install FileCheck
+        uses: ./.github/workflows/install-filecheck
       - name: Test
         run: sbt ++${{ matrix.scala }} test
       - name: Binary compatibility

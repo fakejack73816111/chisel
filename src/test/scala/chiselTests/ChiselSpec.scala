@@ -195,6 +195,39 @@ trait ChiselRunners extends Assertions {
   }
 }
 
+trait FileCheck extends BeforeAndAfterEachTestData { this: Suite =>
+  import scala.Console.{withErr, withOut}
+
+  private def sanitize(n: String): String = n.replaceAll(" ", "_").replaceAll("\\W+", "")
+
+  private val testRunDir: os.Path = os.pwd / os.RelPath(BackendCompilationUtilities.TestDirectory)
+  private val suiteDir:   os.Path = testRunDir / sanitize(suiteName)
+  private var checkFile:  Option[os.Path] = None
+
+  override def beforeEach(testData: TestData): Unit = {
+    // TODO check that these are always available
+    val nameDir = suiteDir / sanitize(testData.name)
+    os.makeDir.all(nameDir)
+    checkFile = Some(nameDir / s"${sanitize(testData.text)}.check")
+    super.beforeEach(testData) // To be stackable, must call super.beforeEach
+  }
+
+  override def afterEach(testData: TestData): Unit = {
+    checkFile = None
+    super.afterEach(testData) // To be stackable, must call super.beforeEach
+  }
+
+  def generateFirrtlAndFileCheck(t: => RawModule, fileCheckArgs: String*)(check: String): Unit = {
+    // Filecheck needs the thing to check in a file
+    os.write.over(checkFile.get, check)
+    val outStream = new ByteArrayOutputStream()
+    val chirrtl = withOut(outStream)(withErr(outStream)(ChiselStage.emitCHIRRTL(t)))
+    val result = outStream.toString + chirrtl
+    val extraArgs = os.Shellable(fileCheckArgs)
+    os.proc("FileCheck", checkFile.get, extraArgs).call(stdin = result)
+  }
+}
+
 /** Spec base class for BDD-style testers. */
 abstract class ChiselFlatSpec extends AnyFlatSpec with ChiselRunners with Matchers
 
