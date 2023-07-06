@@ -10,6 +10,7 @@ import chisel3.stage.{
   PrintFullStackTraceAnnotation,
   SourceRootAnnotation,
   ThrowOnFirstErrorAnnotation,
+  WarningConfigurationAnnotation,
   WarningsAsErrorsAnnotation
 }
 import chisel3.stage.CircuitSerializationAnnotation.FirrtlFileFormat
@@ -36,6 +37,7 @@ trait CLI { this: BareShell =>
     PrintFullStackTraceAnnotation,
     ThrowOnFirstErrorAnnotation,
     WarningsAsErrorsAnnotation,
+    WarningConfigurationAnnotation,
     SourceRootAnnotation,
     SplitVerilog
   ).foreach(_.addOptions(parser))

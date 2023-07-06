@@ -5,8 +5,10 @@ package chisel3.internal
 import scala.annotation.tailrec
 import scala.collection.mutable.{ArrayBuffer, LinkedHashMap, LinkedHashSet}
 import scala.util.control.NoStackTrace
+import scala.util.matching.Regex
 import _root_.logger.Logger
 import java.io.File
+import java.util.regex.PatternSyntaxException
 import scala.io.Source
 
 import chisel3.experimental.{NoSourceInfo, SourceInfo, SourceLine, UnlocatableSourceInfo}
@@ -86,6 +88,101 @@ object ExceptionHelpers {
   }
 }
 
+/** Filter for warnings that can suppress, keep as warning, or elevate to error
+  *
+  * May filter on source file or message, a None filter means "match everything"
+  */
+private[chisel3] case class WarningFilter(src: Option[Regex], msg: Option[Regex], action: WarningFilter.Action) {
+  def applies(source: String, message: String): Boolean = {
+    // Note that None.forall is true
+    src.forall(_.matches(source)) && msg.forall(_.matches(message))
+  }
+}
+private[chisel3] object WarningFilter {
+  sealed trait Action
+  case object Suppress extends Action
+  case object Warn extends Action
+  case object Error extends Action
+
+  // Some helpers for error reporting
+  private def actionOneOf = "must be one of ':e, :w, or :s'."
+  private def categoryOneOf = "must be one of 'any', 'src', or 'msg'."
+
+  // Default additions to the regular expressions
+  private def msgRegexDefault(base: Regex): Regex = new Regex(s".*$base.*")
+  // TODO find a better way to deal with line and column
+  private def srcRegexDefault(base: Regex): Regex = new Regex(s"(.*/)?$base(:\\d*){0,2}")
+
+  /** Parse a String into a [[WarningFilter]]
+    *
+    * @param value String to parse
+    * @return Left on failure with index of invalid character and a message or Right of successfully built Warning Filters
+    */
+  def parse(value: String): Either[(Int, String), WarningFilter] = {
+    val actionIdx = value.lastIndexOf(':')
+    if (actionIdx < 0) {
+      return Left(value.size - 1 -> s"Filter '$value' is missing an action, $actionOneOf")
+    }
+    val (filterStr, actionStr) = value.splitAt(actionIdx)
+    val action: Action = actionStr match {
+      case ":e" => Error
+      case ":w" => Warn
+      case ":s" => Suppress
+      case other =>
+        return Left(actionIdx -> s"Invalid action '$other', $actionOneOf")
+    }
+    val filterParts: List[String] = filterStr.split("&").toList
+    // Add index for adding a carat in error reporting
+    val partsWithIndex: List[(Int, String)] =
+      filterParts
+        .mapAccumulate(0) { case (idx, s) => (idx + 1 + s.length, (idx, s)) } // + 1 for removed '&'
+        ._2
+    // Check legality of the parts
+    val parts: Map[String, Option[Regex]] =
+      partsWithIndex
+        .mapAccumulate(Set.empty[String]) {
+          case (seen, (idx, str)) =>
+            val catIdx = str.indexOf('=')
+            val (category, remainder) = if (catIdx < 0) (str, "") else str.splitAt(catIdx + 1) // +1 to include = in cat
+            val regex = category match {
+              case "any" =>
+                // Any must be unique
+                if (seen.nonEmpty) return Left(idx -> "'any' cannot be combined with other filters.")
+                if (catIdx != -1) return Left(idx -> "'any' cannot have modifiers.")
+                None
+              // Note that split puts '=' with the category instead of regex
+              case cat @ ("src=" | "msg=") =>
+                if (seen("any")) return Left(idx -> "'any' cannot be combined with other filters.")
+                if (seen(cat)) return Left(idx -> s"Cannot have duplicates of the same category.")
+                try {
+                  // Parse user input first so errors point to correct places
+                  val baseRegex = new Regex(remainder)
+                  // Add defaults to make API more friendly
+                  Some(if (cat == "src=") srcRegexDefault(baseRegex) else msgRegexDefault(baseRegex))
+                } catch {
+                  case e: PatternSyntaxException =>
+                    // Calculate offset to error, include category
+                    val jdx = idx + cat.length + e.getIndex
+                    return Left(jdx -> s"Invalid regular expression: ${e.getDescription}")
+                }
+              case other =>
+                val cleanCat = if (other.last == '=') other.init else other // Drop trailing =
+                return Left(idx -> s"Invalid category '$cleanCat', $categoryOneOf")
+            }
+            (seen + category, category -> regex)
+        }
+        ._2 // Discard seen
+        .toMap
+    if (parts.contains("any")) {
+      Right(WarningFilter(None, None, action))
+    } else {
+      val src = parts.get("src=").flatten
+      val msg = parts.get("msg=").flatten
+      Right(WarningFilter(src, msg, action))
+    }
+  }
+}
+
 private[chisel3] class Errors(message: String) extends chisel3.ChiselException(message) with NoStackTrace
 
 private[chisel3] object throwException {
@@ -126,7 +223,10 @@ private[chisel3] object ErrorLog {
   val errTag = "[" + withColor(Console.RED, "error") + "]"
 }
 
-private[chisel3] class ErrorLog(warningsAsErrors: Boolean, sourceRoots: Seq[File]) {
+private[chisel3] class ErrorLog(
+  warningFilters:    Seq[WarningFilter],
+  sourceRoots:       Seq[File],
+  throwOnFirstError: Boolean) {
   import ErrorLog.withColor
 
   private def getErrorLineInFile(sl: SourceLine): List[String] = {
@@ -168,30 +268,49 @@ private[chisel3] class ErrorLog(warningsAsErrors: Boolean, sourceRoots: Seq[File
     }
   }
 
-  private def errorEntry(msg: String, si: Option[SourceInfo], isFatal: Boolean): ErrorEntry = {
+  // TODO refactor this to just hold more information in the ErrorEntry and do extra processing at report time
+  private def errorEntry(msg: String, si: Option[SourceInfo], isFatal: Boolean): Option[ErrorEntry] = {
     val location = errorLocationString(si)
     val sourceLineAndCaret = si.collect { case sl: SourceLine => getErrorLineInFile(sl) }.getOrElse(Nil)
     val fullMessage = if (location.isEmpty) msg else s"$location: $msg"
-    ErrorEntry(fullMessage :: sourceLineAndCaret, isFatal)
+    val errorLines = fullMessage :: sourceLineAndCaret
+
+    val action =
+      if (isFatal) WarningFilter.Error
+      else {
+        warningFilters.collectFirst { case wf if wf.applies(location, msg) => wf.action }
+          .getOrElse(if (isFatal) WarningFilter.Error else WarningFilter.Warn)
+      }
+    action match {
+      case WarningFilter.Error =>
+        val entry = ErrorEntry(errorLines, true)
+        if (throwOnFirstError) {
+          throwException(entry.serialize(includeTag = false))
+        }
+        Some(entry)
+      case WarningFilter.Warn     => Some(ErrorEntry(errorLines, false))
+      case WarningFilter.Suppress => None
+    }
+
   }
 
   /** Log an error message */
   def error(m: String, si: SourceInfo): Unit = {
-    errors += errorEntry(m, Some(si), true)
+    errors ++= errorEntry(m, Some(si), true)
   }
 
-  private def warn(m: String, si: Option[SourceInfo]): ErrorEntry = errorEntry(m, si, warningsAsErrors)
+  private def warn(m: String, si: Option[SourceInfo]): Option[ErrorEntry] = errorEntry(m, si, false)
 
   /** Log a warning message */
   def warning(m: String, si: SourceInfo): Unit = {
-    errors += warn(m, Some(si))
+    errors ++= warn(m, Some(si))
   }
 
   /** Log a warning message without a source locator. This is used when the
     * locator wouldn't be helpful (e.g., due to lazy values).
     */
   def warningNoLoc(m: String): Unit =
-    errors += warn(m, None)
+    errors ++= warn(m, None)
 
   /** Log a deprecation warning message */
   def deprecated(m: String, location: Option[String]): Unit = {
@@ -218,7 +337,7 @@ private[chisel3] class ErrorLog(warningsAsErrors: Boolean, sourceRoots: Seq[File
       case ((message, sourceLoc), count) =>
         logger.warn(s"${ErrorLog.depTag} $sourceLoc ($count calls): $message")
     }
-    errors.foreach(e => logger.error(e.serialize))
+    errors.foreach(e => logger.error(e.serialize(includeTag = true)))
 
     if (!deprecations.isEmpty) {
       logger.warn(
@@ -312,5 +431,8 @@ private[chisel3] class ErrorLog(warningsAsErrors: Boolean, sourceRoots: Seq[File
 private case class ErrorEntry(lines: Seq[String], isFatal: Boolean) {
   def tag = if (isFatal) ErrorLog.errTag else ErrorLog.warnTag
 
-  def serialize: String = lines.map(s"$tag " + _).mkString("\n")
+  def serialize(includeTag: Boolean): String = {
+    val linesx = if (includeTag) lines.map(s"$tag " + _) else lines
+    linesx.mkString("\n")
+  }
 }

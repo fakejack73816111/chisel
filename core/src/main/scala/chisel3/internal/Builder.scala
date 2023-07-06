@@ -417,7 +417,7 @@ private[chisel3] class ChiselContext() {
 private[chisel3] class DynamicContext(
   val annotationSeq:     AnnotationSeq,
   val throwOnFirstError: Boolean,
-  val warningsAsErrors:  Boolean,
+  val warningFilters:    Seq[WarningFilter],
   val sourceRoots:       Seq[File]) {
   val importedDefinitionAnnos = annotationSeq.collect { case a: ImportDefinitionAnnotation[_] => a }
 
@@ -482,7 +482,7 @@ private[chisel3] class DynamicContext(
   var whenStack:            List[WhenContext] = Nil
   var currentClock:         Option[Clock] = None
   var currentReset:         Option[Reset] = None
-  val errors = new ErrorLog(warningsAsErrors, sourceRoots)
+  val errors = new ErrorLog(warningFilters, sourceRoots, throwOnFirstError)
   val namingStack = new NamingStack
 
   // Used to indicate if this is the top-level module of full elaboration, or from a Definition
@@ -774,7 +774,7 @@ private[chisel3] object Builder extends LazyLogging {
   def errors: ErrorLog = dynamicContext.errors
   def error(m: => String)(implicit sourceInfo: SourceInfo): Unit = {
     // If --throw-on-first-error is requested, throw an exception instead of aggregating errors
-    if (dynamicContextVar.value.isDefined && !dynamicContextVar.value.get.throwOnFirstError) {
+    if (dynamicContextVar.value.isDefined) {
       errors.error(m, sourceInfo)
     } else {
       throwException(m)
